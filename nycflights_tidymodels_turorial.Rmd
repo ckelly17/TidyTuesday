@@ -1,0 +1,235 @@
+---
+title: "nycflights"
+date: "12/12/2020"
+output: html_document
+---
+
+**This is an implementation of a logistic regression and random forest classification model framework to test out the basics of the `tidymodels` workflow.** 
+
+-----------------------------------
+
+
+#### Project set-up
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(nycflights13)
+library(tidymodels)
+library(ranger)
+
+```
+
+#### Initial data cleaning
+
+```{r}
+set.seed(123)
+
+flight_data <- flights %>% 
+  mutate(arr_delay = ifelse(arr_delay >= 30, "late", "on_time"), 
+        arr_delay = factor(arr_delay), #  Convert the arrival delay to a factor
+        date = as.Date(time_hour)) %>% # We will use the date (not date-time) in the recipe below
+  
+  # Include the weather data
+  inner_join(weather, by = c("origin", "time_hour")) %>%
+  
+  # will include a variable for whether or not it's raining and the visibility
+  mutate(precip = ifelse(precip > 0, "Yes", "No")) %>%
+  
+  # Only retain the specific columns we will use - keep precipitation
+  select(dep_time, flight, origin, dest, air_time, distance, 
+         carrier, date, arr_delay, time_hour, precip, visib) %>% 
+  
+  # Exclude missing data
+  na.omit() %>% 
+  # For creating models, it is better to have qualitative columns
+  # encoded as factors (instead of character strings)
+  mutate_if(is.character, as.factor)
+
+# From looking at the data, can see that about 16 percent of flights are delayed
+flight_data %>% count(arr_delay) %>%
+  mutate(pct = n / sum(n))
+```
+
+
+#### Split data into training and testing
+
+Do this only once.
+
+```{r split-data}
+# split data
+set.seed(555)
+flights_split <- initial_split(flight_data, prop = 0.8)
+
+# get training and testing
+training <- training(flights_split)
+testing <- testing(flights_split)
+
+```
+
+#### Build a recipe for how to process the training and testing data
+
+* It will apply to both the training and testing sets but is performed independently 
+* Takes the model formula (`y ~ x`) as an input
+
+```{r build-recipe}
+# initiate a new recipe
+flights_recipe <- recipe(arr_delay ~., data = training) %>%
+  update_role(flight, time_hour, new_role = "ID") # update roles to not include in the model
+
+# what does the recipe look like
+summary(flights_recipe)
+  
+# feature engineering with step_
+flights_recipe <- flights_recipe %>%
+  step_date(date, features = c("dow", "month")) %>%               
+  step_holiday(date, holidays = timeDate::listHolidays("US")) %>% 
+  step_rm(date) %>%
+  
+  step_dummy(all_nominal(), -all_outcomes()) %>% # create dummies (should use this more)
+  
+  step_zv(all_predictors()) # remove predictors with wingle value in training set
+
+# could also use step_normalize()?
+
+```
+
+
+
+#### Select your engine
+
+In this case, `logistic_reg()` with `glm` and `rand_forest` with `ranger`
+
+```{r build-workflow}
+# set model enginge
+logit_model <- logistic_reg() %>%
+  set_engine("glm")
+```
+
+#### Create a workflow using a logit model
+* Create a workflow using `workflow()`
+* Add the recipe and the engine to it
+
+```{r build-workflow2}
+# build a workflow that incorporates the recipe and the model
+flights_wflow <- workflow() %>%
+  add_recipe(flights_recipe) %>%
+  add_model(logit_model)
+
+```
+
+
+#### Fit the model on the training set using the `workflow`
+
+* Assign this to a `fit` object 
+* Fit the model on the training set using the workflow
+
+```{r fit-model, cache=TRUE}
+flights_fit <- flights_wflow %>%
+  fit(training)
+
+# look at results
+tidy(flights_fit)
+
+# another way to look at results?
+flights_fit %>%
+  pull_workflow_fit() %>%
+  tidy()
+
+```
+
+#### Use the `fit` object to create predictions for the testing set
+
+This will incorporate the recipe and model specification from the training set
+
+```{r}
+# predict on the testing set
+pred_class <- predict(flights_fit, testing, type = "class")
+pred_prob <- predict(flights_fit, testing, type = "prob")
+
+# add predictions to testing
+results <- bind_cols(testing, pred_class, pred_prob)
+```
+
+#### Evaluate performance
+
+Use `predict` and `metrics` to evaluate performance
+
+
+```{r}
+# get model fit metrics
+metrics(results, truth = arr_delay, estimate = .pred_class)
+
+# look at ROC curve
+results %>% 
+  roc_curve(truth = arr_delay, .pred_late) %>% 
+  autoplot()
+
+```
+
+
+#### Now try running the whole thing again with random forest
+
+
+```{r add-rf, cache=TRUE}
+# add random forest specification
+rf_mod <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+# add to workflow
+flights_rf_wflow <- workflow() %>%
+  add_recipe(flights_recipe) %>%
+  add_model(rf_mod)
+
+flights_rf_wflow
+
+# fit
+flights_rf_fit <- flights_rf_wflow %>%
+  fit(data = training)
+```
+
+
+
+```{r add-rf-pred, cache=TRUE}
+# predict
+pred_rf_prob <- predict(flights_rf_fit, testing, type = "prob")
+pred_rf_class <- predict(flights_rf_fit, testing, type = "class")
+
+# bind
+results_rf <- bind_cols(testing, pred_rf_class, pred_rf_prob)
+```
+
+
+
+
+```{r eval-rf-pred, cache=TRUE}
+# get metrics
+metrics(results_rf, truth = arr_delay, estimate = .pred_class)
+
+
+
+```
+
+
+#### If desired, use cross-validation on the training set before final testing
+
+* Create `folds` object using `vfold_cv`
+* Initiate `workflow()` and pipe to `fit_resamples` on `folds`
+* Use `collect_metrics()` on the output to look at accuracy across folds
+
+```{r cv, cache=TRUE, message=FALSE, warning=FALSE}
+
+# set folds
+folds <- vfold_cv(training, v = 10)
+
+# apply workflow
+logit_cv_results <- flights_wflow %>%
+  fit_resamples(folds)
+
+# look at metrics from cross-validation
+collect_metrics(logit_cv_results)
+
+
+```
+
